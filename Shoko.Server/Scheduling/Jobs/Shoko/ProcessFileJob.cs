@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using FluentNHibernate.Conventions;
 using Microsoft.Extensions.Logging;
 using Quartz;
 using Shoko.Server.Extensions;
@@ -222,7 +221,7 @@ public class ProcessFileJob : BaseJob
                     foreach (var epFiles in filesPerEpisode)
                     {
                         // Keep the file if any other file for the episode does not exist
-                        if (epFiles.IsEmpty())
+                        if (!epFiles.Any())
                         {
                             videoLocals.Remove(vlocal);
                             break;
