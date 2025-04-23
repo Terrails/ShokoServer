@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using FluentNHibernate.Conventions;
 using Microsoft.Extensions.Logging;
 using Quartz;
 using Shoko.Server.Extensions;
@@ -139,29 +140,6 @@ public class ProcessFileJob : BaseJob
         // update stats for groups and series. The series are not saved until here, so it's absolutely necessary!!
         await Task.WhenAll(animeIDs.Keys.Select(a => _jobFactory.CreateJob<RefreshAnimeStatsJob>(b => b.AnimeID = a).Process())).ConfigureAwait(false);
 
-        if (_settings.FileQualityFilterEnabled)
-        {
-            videoLocals.Sort(FileQualityFilter.CompareTo);
-            var keep = videoLocals
-                .Take(FileQualityFilter.Settings.MaxNumberOfFilesToKeep)
-                .ToList();
-            foreach (var vl2 in keep)
-            {
-                videoLocals.Remove(vl2);
-            }
-
-            if (!FileQualityFilter.Settings.AllowDeletionOfImportedFiles &&
-                videoLocals.Contains(_vlocal))
-            {
-                videoLocals.Remove(_vlocal);
-            }
-
-            videoLocals = videoLocals.Where(a => !FileQualityFilter.CheckFileKeep(a)).ToList();
-
-            foreach (var place in videoLocals.SelectMany(a => a.Places))
-                await _vlPlaceService.RemoveRecordAndDeletePhysicalFile(place).ConfigureAwait(false);
-        }
-
         // we have an AniDB File, so check the release group info
         if (aniFile.GroupID != 0)
         {
@@ -172,6 +150,97 @@ public class ProcessFileJob : BaseJob
                 // this will only happen if it's null, and most people grab mostly the same release groups
                 var groupCommand = _jobFactory.CreateJob<GetAniDBReleaseGroupJob>(c => c.GroupID = aniFile.GroupID);
                 await groupCommand.Process().ConfigureAwait(false);
+            }
+        }
+
+        if (_settings.FileQualityFilterEnabled)
+        {
+            if (!FileQualityFilter.CheckFileKeep(_vlocal))
+            {
+                if (FileQualityFilter.Settings.AllowDeletionOfImportedFiles)
+                {
+                    _logger.LogInformation("Deleting file as it does not satisfy required settings: {FileName}", _fileName);
+                    // delete the file if the settings allow it
+                    foreach (var place in _vlocal.Places)
+                        await _vlPlaceService.RemoveRecordAndDeletePhysicalFile(place).ConfigureAwait(false);
+                }
+                else
+                {
+                    _logger.LogInformation("Skipping file as it does not satisfy required settings: {FileName}", _fileName);
+                }
+                // disallow from being imported by returning null
+                return null;
+            }
+
+            // File satisfies the required settings, so go onto preferred settings
+
+            // Sort the files by quality
+            videoLocals.Sort(FileQualityFilter.CompareTo);
+            var keep = videoLocals
+                .Take(FileQualityFilter.Settings.MaxNumberOfFilesToKeep)
+                .ToList();
+
+            // Remove the files that are in the keep list
+            foreach (var vl2 in keep)
+            {
+                videoLocals.Remove(vl2);
+            }
+
+            if (videoLocals.Contains(_vlocal))
+            {
+                _logger.LogInformation("Skipping file as it is not better than existing files: {FileName}", _fileName);
+                if (!FileQualityFilter.Settings.AllowDeletionOfImportedFiles)
+                {
+                    foreach (var place in _vlocal.Places)
+                        await _vlPlaceService.RemoveRecordAndDeletePhysicalFile(place).ConfigureAwait(false);
+                }
+
+                return null;
+            }
+            else
+            {
+                // Go through all files that are marked for removal
+                // We need to check if the file is a multi-episode release
+                // If it is, we need to check if all episodes exist in higher quality
+                for (var i = videoLocals.Count - 1; i >= 0; i--)
+                {
+                    var vlocal = videoLocals[i];
+                    var anidbFile = GetLocalAniDBFile(vlocal);
+                    if (anidbFile.Episodes.Count == 1)
+                    {
+                        // This is a single-episode release, so we can remove it
+                        continue;
+                    }
+
+                    // This is a multi-episode release, so we need to check if all episodes exist in higher quality
+
+                    // Get all episodes that are in this file
+                    var allEpisodes = anidbFile.Episodes.Select(a => RepoFactory.AniDB_Episode.GetByEpisodeID(a.EpisodeID)).ToList();
+                    // Get all files per episode excluding the current file
+                    var filesPerEpisode = allEpisodes.Select(a => RepoFactory.VideoLocal.GetByAniDBEpisodeID(a.EpisodeID).Where(v => v.VideoLocalID != vlocal.VideoLocalID)).ToList();
+
+                    foreach (var epFiles in filesPerEpisode)
+                    {
+                        // Keep the file if any other file for the episode does not exist
+                        if (epFiles.IsEmpty())
+                        {
+                            videoLocals.Remove(vlocal);
+                            break;
+                        }
+
+                        // Check if any of the files is in higher quality or equal
+                        var higherQuality = epFiles.Any(epFile => FileQualityFilter.CompareTo(epFile, vlocal) <= 0);
+                        if (!higherQuality)
+                        {
+                            // There is no instance of the episode in higher quality, so we do not remove the multi-episode file
+                            videoLocals.Remove(vlocal);
+                            break;
+                        }
+                    }
+                }
+
+                foreach (var place in videoLocals.SelectMany(a => a.Places))
+                    await _vlPlaceService.RemoveRecordAndDeletePhysicalFile(place).ConfigureAwait(false);
             }
         }
 
