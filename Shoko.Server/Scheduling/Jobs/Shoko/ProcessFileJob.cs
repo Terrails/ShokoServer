@@ -159,7 +159,6 @@ public class ProcessFileJob : BaseJob
                 if (FileQualityFilter.Settings.AllowDeletionOfImportedFiles)
                 {
                     _logger.LogInformation("Deleting file as it does not satisfy required settings: {FileName}", _fileName);
-                    // delete the file if the settings allow it
                     foreach (var place in _vlocal.Places)
                         await _vlPlaceService.RemoveRecordAndDeletePhysicalFile(place).ConfigureAwait(false);
                 }
@@ -167,79 +166,48 @@ public class ProcessFileJob : BaseJob
                 {
                     _logger.LogInformation("Skipping file as it does not satisfy required settings: {FileName}", _fileName);
                 }
-                // disallow from being imported by returning null
-                return null;
+                return null; // disallow from being imported
             }
 
-            // File satisfies the required settings, so go onto preferred settings
+            var containsSingleEpisode = _vlocal.AnimeEpisodes.Count == 1;
+            var hasPartialEpisodes = _vlocal.EpisodeCrossReferences.Any(cf => cf.Percentage != 100);
 
-            // Sort the files by quality
-            videoLocals.Sort(FileQualityFilter.CompareTo);
-            var keep = videoLocals
-                .Take(FileQualityFilter.Settings.MaxNumberOfFilesToKeep)
-                .ToList();
-
-            // Remove the files that are in the keep list
-            foreach (var vl2 in keep)
+            // Only process files that are not multi-episode and not partial
+            if (containsSingleEpisode && !hasPartialEpisodes)
             {
-                videoLocals.Remove(vl2);
-            }
+                var filter = videoLocals
+                    .Where(v => v.AnimeEpisodes.Count == 1)
+                    .Where(v => v.EpisodeCrossReferences.All(e => e.Percentage == 100))
+                    .ToList();
 
-            if (videoLocals.Contains(_vlocal))
-            {
-                _logger.LogInformation("Skipping file as it is not better than existing files: {FileName}", _fileName);
-                if (!FileQualityFilter.Settings.AllowDeletionOfImportedFiles)
+                filter.Sort(FileQualityFilter.CompareTo);
+
+                var keep = filter.Take(FileQualityFilter.Settings.MaxNumberOfFilesToKeep).ToList();
+                var delete = filter.Except(keep).ToList();
+
+                var isFileWorse = delete.Contains(_vlocal);
+                if (isFileWorse)
                 {
-                    foreach (var place in _vlocal.Places)
-                        await _vlPlaceService.RemoveRecordAndDeletePhysicalFile(place).ConfigureAwait(false);
-                }
-
-                return null;
-            }
-            else
-            {
-                // Go through all files that are marked for removal
-                // We need to check if the file is a multi-episode release
-                // If it is, we need to check if all episodes exist in higher quality
-                for (var i = videoLocals.Count - 1; i >= 0; i--)
-                {
-                    var vlocal = videoLocals[i];
-                    var anidbFile = GetLocalAniDBFile(vlocal);
-                    if (anidbFile.Episodes.Count == 1)
+                    if (FileQualityFilter.Settings.AllowDeletionOfImportedFiles)
                     {
-                        // This is a single-episode release, so we can remove it
-                        continue;
+                        _logger.LogInformation("Deleting file as it is not better than existing files: {FileName}", _fileName);
                     }
-
-                    // This is a multi-episode release, so we need to check if all episodes exist in higher quality
-
-                    // Get all episodes that are in this file
-                    var allEpisodes = anidbFile.Episodes.Select(a => RepoFactory.AniDB_Episode.GetByEpisodeID(a.EpisodeID)).ToList();
-                    // Get all files per episode excluding the current file
-                    var filesPerEpisode = allEpisodes.Select(a => RepoFactory.VideoLocal.GetByAniDBEpisodeID(a.EpisodeID).Where(v => v.VideoLocalID != vlocal.VideoLocalID)).ToList();
-
-                    foreach (var epFiles in filesPerEpisode)
+                    else
                     {
-                        // Keep the file if any other file for the episode does not exist
-                        if (!epFiles.Any())
-                        {
-                            videoLocals.Remove(vlocal);
-                            break;
-                        }
-
-                        // Check if any of the files is in higher quality or equal
-                        var higherQuality = epFiles.Any(epFile => FileQualityFilter.CompareTo(epFile, vlocal) <= 0);
-                        if (!higherQuality)
-                        {
-                            // There is no instance of the episode in higher quality, so we do not remove the multi-episode file
-                            videoLocals.Remove(vlocal);
-                            break;
-                        }
+                        _logger.LogInformation("Skipping file as it is not better than existing files: {FileName}", _fileName);
+                        delete.Remove(_vlocal);
                     }
                 }
 
-                foreach (var place in videoLocals.SelectMany(a => a.Places))
+                foreach (var place in delete.SelectMany(a => a.Places))
+                {
                     await _vlPlaceService.RemoveRecordAndDeletePhysicalFile(place).ConfigureAwait(false);
+                }
+
+                if (isFileWorse)
+                {
+                    return null; // disallow from being imported
+                }
             }
         }
 
